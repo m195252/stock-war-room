@@ -167,11 +167,11 @@ CSS = """
 .judge{font-size:15px;font-weight:600;margin-top:12px;}
 .judge.hot{color:#e5533c;}.judge.bad{color:#4c9a6a;}.judge.neutral{color:#b5b8a6;}
 
-.heats{display:flex;flex-wrap:wrap;gap:8px;margin:4px 0 10px;}
-.heat{flex:1 1 112px;max-width:170px;border-radius:10px;padding:10px 12px;color:#ffffff;border:1px solid #33362a;border-left-width:5px;}
-.h-name{font-size:13px;font-weight:600;color:#ffffff;}
-.h-val{font-size:22px;font-weight:700;margin:2px 0;color:#ffffff;}
-.h-sub{font-size:12px;color:#e6e8da;}
+.heats{display:flex;flex-wrap:wrap;gap:5px;margin:2px 0 8px;}
+.heat{flex:1 1 76px;max-width:104px;border-radius:7px;padding:4px 8px;color:#ffffff;border:1px solid #33362a;border-left-width:4px;line-height:1.25;}
+.h-name{font-size:11.5px;font-weight:600;color:#ffffff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.h-val{font-size:15px;font-weight:700;margin:0;color:#ffffff;}
+.h-sub{font-size:10px;color:#e6e8da;}
 .card.pass{border-color:#2f7a3f;box-shadow:inset 4px 0 0 #2f7a3f;}
 .gates{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:12px;padding-top:12px;border-top:1px solid #33362a;}
 .gcell{font-size:12.5px;color:#eeeee2;line-height:1.5;}
@@ -245,6 +245,27 @@ CSS = """
 .zc{font-size:12.5px;margin-top:5px;color:#374151;}
 .calc{display:flex;flex-wrap:wrap;gap:16px;align-items:center;font-size:14px;color:#1f2933;padding-top:6px;}
 .pos{color:#d9363e;}.neg{color:#1a7f37;}.muted{color:#8b909a;font-size:12.5px;}
+.ml{display:none;}
+@media (max-width:640px){
+  .rh{display:none;}
+  .rw{grid-template-columns:1fr 1fr;grid-template-areas:"c1 c1" "trig price" "vol k";gap:6px 10px;padding:9px 10px 2px;align-items:stretch;}
+  .rw .c1{grid-area:c1;flex-direction:column;gap:2px;}
+  .rw .cdb{display:flex;gap:10px;align-items:baseline;min-width:0;}
+  .rw .nm{font-size:17px;}
+  .g-trig{grid-area:trig;} .g-price{grid-area:price;}
+  .g-price div{display:inline-block;margin-left:8px;}
+  .g-vol{grid-area:vol;} .g-k{grid-area:k;}
+  .g-trig,.g-price,.g-vol,.g-k{background:rgba(255,255,255,.55);border-radius:8px;padding:6px 8px;}
+  .ml{display:block;font-size:11px;color:#8b909a;margin-bottom:2px;}
+  .g-price b{font-size:17px;}
+  .rx{padding:2px 10px 10px;}
+  .pbw{max-width:100%;}
+  .zn{flex:1 1 100%;}
+  div[data-testid="stColumn"]:has([data-testid="stLinkButton"]) > div[data-testid="stVerticalBlock"],
+  div[data-testid="column"]:has([data-testid="stLinkButton"]) > div[data-testid="stVerticalBlock"]{flex-direction:row;gap:8px;}
+  div[data-testid="stColumn"]:has([data-testid="stLinkButton"]) [data-testid="stElementContainer"],
+  div[data-testid="column"]:has([data-testid="stLinkButton"]) [data-testid="element-container"]{flex:1;}
+}
 </style>
 """
 
@@ -547,7 +568,10 @@ def row_html(row, cols, gate):
         f'<div class="up">更新 {e(upd)}</div></div>'
         f'<div class="nmb"><div class="l1"><b class="nm">{e(g(row, cols, "name"))}</b>{tag}</div>'
         f'<div class="sub">{sub}</div></div></div>'
-        f'<div>{c2}</div><div>{c3}</div><div>{c4}</div><div>{c5}</div></div>'
+        f'<div class="g-trig"><span class="ml">觸發</span>{c2}</div>'
+        f'<div class="g-price"><span class="ml">現價</span>{c3}</div>'
+        f'<div class="g-vol"><span class="ml">第三關 量價</span>{c4}</div>'
+        f'<div class="g-k"><span class="ml">第四關 K 棒</span>{c5}</div></div>'
         f'<div class="rx">{bar}</div></div>'
     )
 
@@ -808,7 +832,7 @@ if cols["cat"] and cols["chg"]:
             f'<div class="heat" style="background:{bg};border-left-color:{edge}"><div class="h-name">{html.escape(str(cat_name))}</div>'
             f'<div class="h-val">{txt}</div><div class="h-sub">{int(r["n"])} 檔｜上漲 {int(r["up"])}</div></div>'
         )
-    st.markdown("##### 🌡️ 分類當日漲跌熱度（平均，紅漲綠跌）")
+    st.markdown('<div style="font-size:14px;font-weight:600;margin:4px 0 2px">🌡️ 分類當日漲跌熱度（平均，紅漲綠跌）</div>', unsafe_allow_html=True)
     st.markdown(f'<div class="heats">{"".join(tiles)}</div>', unsafe_allow_html=True)
 
 # ------------------------------------------------------------------
@@ -834,20 +858,40 @@ if all(cols[k] for k in ("brk", "op", "season", "month", "vol", "kbar")):
         unsafe_allow_html=True,
     )
     if passed:
-        pills = []
+        _lab = {}
         for row_, r_ in passed:
-            dot = "#2f6fdc" if r_["trigger"] == "A" else "#e8672c"
-            kind = "突破・追強勢" if r_["trigger"] == "A" else "回測・買防守"
-            pills.append(
-                f'<span title="{kind}" style="display:inline-flex;align-items:center;gap:8px;background:#fff;'
-                f'border:1px solid #d9dcd2;border-radius:10px;padding:8px 14px;margin:0 8px 8px 0;font-size:15px;{D}">'
-                f'<span style="width:10px;height:10px;border-radius:50%;background:{dot};display:inline-block"></span>'
-                f'<b>{html.escape(g(row_, cols, "name"))}</b>'
-                f'<span style="color:#8a8f80">{html.escape(g(row_, cols, "code"))}</span>'
-                f'<span>{fmt(row_[cols["price"]]) if cols["price"] else "-"}</span>'
-                f'{chg_span(chg_num(row_, cols))}</span>'
+            c_ = g(row_, cols, "code")
+            dot_ = "🔵" if r_["trigger"] == "A" else "🟠"
+            pr_ = fmt(row_[cols["price"]]) if cols["price"] else "-"
+            _lab[c_] = f"{dot_} {g(row_, cols, 'name')} {c_}　{pr_} {chg_num(row_, cols):+.1f}%"
+        if hasattr(st, "pills"):
+            def _open_pick():
+                c_ = st.session_state.get("pass_pick")
+                if c_:
+                    st.session_state["dialog_code"] = c_
+                    st.session_state["pass_pick"] = None
+
+            st.pills(
+                "點選個股，彈出明細", options=list(_lab), format_func=lambda c: _lab[c],
+                selection_mode="single", key="pass_pick", on_change=_open_pick,
+                label_visibility="collapsed",
             )
-        st.markdown("".join(pills), unsafe_allow_html=True)
+            st.caption("🔵 突破・追強勢　🟠 回測・買防守　｜　點個股名稱，彈出明細視窗")
+        else:
+            pills = []
+            for row_, r_ in passed:
+                dot = "#2f6fdc" if r_["trigger"] == "A" else "#e8672c"
+                kind = "突破・追強勢" if r_["trigger"] == "A" else "回測・買防守"
+                pills.append(
+                    f'<span title="{kind}" style="display:inline-flex;align-items:center;gap:8px;background:#fff;'
+                    f'border:1px solid #d9dcd2;border-radius:10px;padding:8px 14px;margin:0 8px 8px 0;font-size:15px;{D}">'
+                    f'<span style="width:10px;height:10px;border-radius:50%;background:{dot};display:inline-block"></span>'
+                    f'<b>{html.escape(g(row_, cols, "name"))}</b>'
+                    f'<span style="color:#8a8f80">{html.escape(g(row_, cols, "code"))}</span>'
+                    f'<span>{fmt(row_[cols["price"]]) if cols["price"] else "-"}</span>'
+                    f'{chg_span(chg_num(row_, cols))}</span>'
+                )
+            st.markdown("".join(pills), unsafe_allow_html=True)
     else:
         st.info("目前沒有標的通過四道關卡。")
 
@@ -1012,16 +1056,6 @@ with st.expander("📐 交易策略：條件與參數", expanded=False):
         "5. **1/3 停利價**＝進場價 × (1 + 停利 %)。"
     )
 
-if view.empty:
-    st.warning("沒有符合條件的標的，請放寬左側篩選。")
-    st.stop()
-
-c1, c2 = st.columns([1, 1])
-page_size = c1.selectbox("每頁顯示", [20, 50, 100, 500], index=0)
-pages = max(1, -(-len(view) // page_size))
-page = c2.number_input("頁碼", min_value=1, max_value=pages, value=1, step=1)
-chunk = view.iloc[(page - 1) * page_size: page * page_size]
-
 if "open_code" not in st.session_state:
     st.session_state.open_code = None
 
@@ -1030,7 +1064,7 @@ def toggle(code):
     st.session_state.open_code = None if st.session_state.open_code == code else code
 
 
-def render_chart(row):
+def render_chart(row, prefix="", width=1100):
     code = g(row, cols, "code")
     sup = row[cols["support"]] if cols["support"] else None
     res = row[cols["resistance"]] if cols["resistance"] else None
@@ -1039,7 +1073,7 @@ def render_chart(row):
     except Exception as e:
         st.error(f"抓不到 {code} 的歷史資料")
         st.code(str(e))
-        if st.button("清除快取並重試", key=f"retry_{code}"):
+        if st.button("清除快取並重試", key=f"{prefix}retry_{code}"):
             st.cache_data.clear()
             st.rerun()
         return
@@ -1055,7 +1089,7 @@ def render_chart(row):
                f"｜{seg('支撐', sup)}｜{seg('壓力', res)}")
     data = data.copy()
     data["time"] = pd.to_datetime(data["time"]).dt.normalize().astype("datetime64[ns]")
-    chart = StreamlitChart(width=1100, height=560)
+    chart = StreamlitChart(width=width, height=560)
     chart.time_scale(time_visible=False)
     chart.set(data)
     if pd.notna(sup):
@@ -1074,13 +1108,10 @@ def _cols2():
         return st.columns([9.4, 1.3])
 
 
-hl, _h1 = _cols2()
-hl.markdown(HEADER_HTML, unsafe_allow_html=True)
-
-def render_strategy(code, info):
+def render_strategy(code, info, prefix=""):
     price = info["price"]
     use_auto = st.checkbox(
-        "🔍 自動抓取歷史 K 線，找突破 K 棒（量大優先）算停損", value=False, key=f"auto_{code}",
+        "🔍 自動抓取歷史 K 線，找突破 K 棒（量大優先）算停損", value=False, key=f"{prefix}auto_{code}",
         help="會下載該股近半年日 K，可能多花幾秒；抓不到時請手動輸入停損價。",
     )
     bars = None
@@ -1102,11 +1133,56 @@ def render_strategy(code, info):
     step = float(tick_size(price))
     c_in, c_stop, c_out = st.columns([1, 1, 2.6])
     entry = c_in.number_input("手動輸入進場價", min_value=0.0, value=float(price), step=step,
-                              format="%.2f", key=f"man_{code}")
+                              format="%.2f", key=f"{prefix}man_{code}")
     stop_in = c_stop.number_input("停損價（可改）", min_value=0.0, value=float(default_stop), step=step,
-                                  format="%.2f", key=f"stop_{code}_{default_stop}")
+                                  format="%.2f", key=f"{prefix}stop_{code}_{default_stop}")
     c_out.markdown(calc_html(float(entry), float(stop_in), tp_pct / 100), unsafe_allow_html=True)
 
+
+def stock_detail(code_):
+    sel_ = df[df[cols["code"]] == code_]
+    if sel_.empty:
+        st.info("找不到這檔的資料。")
+        return
+    row_ = sel_.iloc[0]
+    st.markdown(row_html(row_, cols, gate_map.get(code_)), unsafe_allow_html=True)
+    st.link_button("TradingView 開啟", f"https://www.tradingview.com/chart/?symbol=TWSE%3A{code_}")
+    info_ = strategy_info(row_, cols, band_pct)
+    if info_:
+        st.markdown("##### 📌 交易策略")
+        render_strategy(code_, info_, prefix="dlg_")
+    st.markdown("##### 📈 K 線圖")
+    render_chart(row_, prefix="dlg_", width=700)
+
+
+if hasattr(st, "dialog"):
+    @st.dialog("個股明細", width="large")
+    def _stock_dialog(code_):
+        stock_detail(code_)
+else:
+    _stock_dialog = None
+
+_pick = st.session_state.get("dialog_code")
+if _pick:
+    st.session_state["dialog_code"] = None
+    if _stock_dialog:
+        _stock_dialog(_pick)
+    else:
+        with st.container(border=True):
+            stock_detail(_pick)
+
+if view.empty:
+    st.warning("沒有符合條件的標的，請放寬左側篩選。")
+    st.stop()
+
+c1, c2 = st.columns([1, 1])
+page_size = c1.selectbox("每頁顯示", [20, 50, 100, 500], index=0)
+pages = max(1, -(-len(view) // page_size))
+page = c2.number_input("頁碼", min_value=1, max_value=pages, value=1, step=1)
+chunk = view.iloc[(page - 1) * page_size: page * page_size]
+
+hl, _h1 = _cols2()
+hl.markdown(HEADER_HTML, unsafe_allow_html=True)
 
 for i, row in chunk.iterrows():
     code = g(row, cols, "code")
