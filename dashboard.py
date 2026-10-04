@@ -34,6 +34,7 @@ COL_CANDIDATES = {
     "vol": ["量價", "N欄量價"],
     "season": ["季線", "O欄季線"],
     "month": ["月線", "P欄月線"],
+    "upd": ["上次更新日期", "更新日期", "更新時間", "最後更新", "更新"],
 }
 PREFIX_FALLBACK = {"brk": "突破狀態", "dev": "乖離率", "support": "支撐", "resistance": "壓力"}
 
@@ -54,13 +55,21 @@ def to_num(s):
     return pd.to_numeric(s.astype(str).str.replace(",", "", regex=False), errors="coerce")
 
 
+def _now_tw():
+    """台北時間（UTC+8）的 月/日 時:分。"""
+    return (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=8)).strftime("%m/%d %H:%M")
+
+
+FETCHED_AT = ""
+
+
 @st.cache_data(ttl=300, show_spinner=False)
-def load_csv(source) -> pd.DataFrame:
+def load_csv(source):
     for enc in ("utf-8-sig", "utf-8", "cp950"):
         try:
             if hasattr(source, "seek"):
                 source.seek(0)
-            return pd.read_csv(source, encoding=enc, dtype=str)
+            return pd.read_csv(source, encoding=enc, dtype=str), _now_tw()
         except (UnicodeDecodeError, UnicodeError):
             continue
     raise ValueError("無法解讀 CSV 編碼")
@@ -218,6 +227,24 @@ CSS = """
 .rx .t-op{font-weight:600;}
 .rx .t-mild{background:#eef0ea;color:#5c6270;}
 .rx .t-neutral{background:#eef0ea;color:#7a808c;}
+.c1{display:flex;gap:12px;align-items:flex-start;}
+.cdb{min-width:86px;}
+.rw .cdb .cd{margin-right:0;line-height:1.3;}
+.rw .cdb .up{font-size:11px;color:#9aa0aa;white-space:nowrap;line-height:1.3;margin-top:1px;}
+.nmb{min-width:0;}
+.mini-title{display:inline-flex;align-items:center;background:#ffffff;border:1px solid #d9dcd2;border-radius:10px;padding:8px 14px;font-size:15px;font-weight:600;color:#1b2a1b;margin:6px 0 4px;}
+.stg{background:#fbfcf8;border:1px solid #dde3d3;border-radius:10px;padding:10px 12px;color:#1f2933;}
+.stg-h{font-weight:600;font-size:14px;margin-bottom:8px;}
+.stg-st{background:#e8efe0;color:#3b5a2a;border-radius:10px;padding:1px 9px;font-size:12.5px;font-weight:500;}
+.zns{display:flex;gap:10px;flex-wrap:wrap;}
+.zn{flex:1 1 260px;border:1px solid #e1e5d8;border-radius:8px;padding:8px 10px;background:#ffffff;opacity:.72;}
+.zn.on{border-color:#2f7a3f;background:#eef6ea;opacity:1;}
+.zt{font-size:12.5px;color:#6b7280;}
+.zr{font-size:14px;margin-top:2px;}
+.zh{font-size:12px;color:#8b909a;margin-top:1px;}
+.zc{font-size:12.5px;margin-top:5px;color:#374151;}
+.calc{display:flex;flex-wrap:wrap;gap:16px;align-items:center;font-size:14px;color:#1f2933;padding-top:6px;}
+.pos{color:#d9363e;}.neg{color:#1a7f37;}.muted{color:#8b909a;font-size:12.5px;}
 </style>
 """
 
@@ -243,8 +270,6 @@ def g(row, cols, key):
 def fmt(v):
     return "-" if v is None or pd.isna(v) else f"{v:,.2f}".rstrip("0").rstrip(".")
 
-
-GATE_TIP = "建議買進 Tier 2 標準單，並於成本 -5% 處設定硬停損，第一目標 +10% 停利 1/3"
 
 
 def eval_gates(row, cols):
@@ -442,6 +467,7 @@ def row_html(row, cols, gate):
     sup = row[cols["support"]] if cols["support"] else None
     res = row[cols["resistance"]] if cols["resistance"] else None
     cv = chg_num(row, cols)
+    upd = g(row, cols, "upd") or FETCHED_AT
 
     # 名稱下方：分類・季線之上/之下・月線
     sa = gate.get("season_above")
@@ -517,10 +543,169 @@ def row_html(row, cols, gate):
 
     return (
         f'<div class="rw2 {cls}"><div class="rw">'
-        f'<div><div class="l1"><span class="cd">{e(g(row, cols, "code"))}</span>'
-        f'<b class="nm">{e(g(row, cols, "name"))}</b>{tag}</div><div class="sub">{sub}</div></div>'
+        f'<div class="c1"><div class="cdb"><div class="cd">{e(g(row, cols, "code"))}</div>'
+        f'<div class="up">更新 {e(upd)}</div></div>'
+        f'<div class="nmb"><div class="l1"><b class="nm">{e(g(row, cols, "name"))}</b>{tag}</div>'
+        f'<div class="sub">{sub}</div></div></div>'
         f'<div>{c2}</div><div>{c3}</div><div>{c4}</div><div>{c5}</div></div>'
         f'<div class="rx">{bar}</div></div>'
+    )
+
+
+# ------------------------------------------------------------------
+# 交易策略 1：突破後回測（條件取自試算表欄位）
+# ------------------------------------------------------------------
+def tick_size(p):
+    """台股跳動單位。"""
+    if p < 10:
+        return 0.01
+    if p < 50:
+        return 0.05
+    if p < 100:
+        return 0.1
+    if p < 500:
+        return 0.5
+    if p < 1000:
+        return 1.0
+    return 5.0
+
+
+def tick_round(p):
+    t = tick_size(p)
+    return round(round(p / t) * t, 2)
+
+
+def strategy_info(row, cols, band):
+    """符合條件才回傳策略資料，否則 None。band 為進場區間（%）。"""
+    brk, op = g(row, cols, "brk"), g(row, cols, "op")
+    broke = any(k in brk for k in ("今日突破", "昨日突破", "已突破"))
+    retest = ("回測支撐" in brk) or ("回測買點" in op)
+    if not (broke or retest):
+        return None
+    sup = row[cols["support"]] if cols["support"] else None
+    res = row[cols["resistance"]] if cols["resistance"] else None
+    price = row[cols["price"]] if cols["price"] else None
+    if any(v is None or pd.isna(v) for v in (sup, res, price)) or res <= sup:
+        return None
+    b = band / 100
+    if price >= res:
+        state, focus = "已突破・站穩壓力價", "res"
+    elif price <= sup * (1 + b):
+        state, focus = "跌回支撐價", "sup"
+    else:
+        state, focus = "突破後回測中", "both"
+    zones = {
+        "res": (tick_round(res * (1 - b)), tick_round(res), tick_round(res * (1 + b))),
+        "sup": (tick_round(sup * (1 - b)), tick_round(sup), tick_round(sup * (1 + b))),
+    }
+    return {"state": state, "focus": focus, "zones": zones, "price": float(price)}
+
+
+def zone_hint(p, lo, hi):
+    if lo <= p <= hi:
+        return "現價在進場區內"
+    if p > hi:
+        return f"現價高於進場區 {(p - hi) / hi * 100:.1f}%"
+    return f"現價低於進場區 {(lo - p) / lo * 100:.1f}%"
+
+
+def zone_label(info):
+    z = info["zones"]
+    if info["focus"] == "res":
+        return f"壓力區 {fmt(z['res'][0])}～{fmt(z['res'][2])}"
+    if info["focus"] == "sup":
+        return f"支撐區 {fmt(z['sup'][0])}～{fmt(z['sup'][2])}"
+    return f"壓力區 {fmt(z['res'][0])}～{fmt(z['res'][2])}｜支撐區 {fmt(z['sup'][0])}～{fmt(z['sup'][2])}"
+
+
+def ticks_down(p, n):
+    """價格往下移 n 檔（逐檔依台股跳動單位，跨價位級距也正確）。"""
+    for _ in range(int(n)):
+        p = round(p - tick_size(p - 1e-9), 2)
+    return p
+
+
+def find_breakout_bar(data, level, big_mult):
+    """找出「向上突破 level」的日 K：收盤站上 level、前一日收盤在 level 之下。
+    優先取量大者（成交量 ≥ big_mult × 前 20 日均量）中最近的一根；沒有大量的就取最近一根。"""
+    d = data.reset_index(drop=True).copy()
+    d["vol_ma"] = d["volume"].rolling(20, min_periods=5).mean().shift(1)
+    cross = d[(d["close"] > level) & (d["close"].shift(1) <= level)]
+    if cross.empty:
+        return None
+    big = cross[(cross["vol_ma"] > 0) & (cross["volume"] >= big_mult * cross["vol_ma"])]
+    bar = (big if not big.empty else cross).iloc[-1]
+    ratio = float(bar["volume"] / bar["vol_ma"]) if pd.notna(bar["vol_ma"]) and bar["vol_ma"] > 0 else None
+    return {
+        "date": pd.to_datetime(bar["time"]).strftime("%m/%d"),
+        "low": float(bar["low"]), "high": float(bar["high"]),
+        "ratio": ratio, "big": not big.empty,
+    }
+
+
+def compute_stops(bars, n_ticks):
+    """bars 為 None（未啟用自動）或 {'res': bar|None, 'sup': bar|None}。"""
+    out = {"res": None, "sup": None}
+    if bars:
+        for k in ("res", "sup"):
+            if bars.get(k):
+                out[k] = ticks_down(bars[k]["low"], n_ticks)
+    return out
+
+
+def strategy_html(info, band, tp, bars, n_ticks):
+    """tp 為小數（0.10）。bars 同 compute_stops。"""
+    stops = compute_stops(bars, n_ticks)
+
+    def block(title, key):
+        lo, mid, hi = info["zones"][key]
+        on = "on" if info["focus"] in (key, "both") else ""
+        tpp = tick_round(mid * (1 + tp))
+        if bars is None:
+            stop_line = '<span class="muted">停損：勾選下方「自動抓取」，或手動輸入</span>'
+        elif not bars.get(key):
+            stop_line = '<span class="muted">近半年找不到突破這個價位的 K 棒 → 請手動輸入停損</span>'
+        else:
+            b = bars[key]
+            ratio = f"｜量 {b['ratio']:.1f}× 均量" if b["ratio"] else ""
+            kind = "大量突破K" if b["big"] else "突破K（無大量，取最近一根）"
+            stp = stops[key]
+            if stp >= mid:
+                pct_txt = '<span class="muted">（高於進場價，不適用，請手動輸入）</span>'
+            else:
+                pct_txt = f'<b class="neg">{(stp - mid) / mid * 100:+.1f}%</b>'
+            stop_line = (f'{kind} {b["date"]}｜低 {fmt(b["low"])}{ratio} → 停損 '
+                         f'<b class="neg">{fmt(stp)}</b>（低點下 {n_ticks} 檔，距進場價 {pct_txt}）')
+        return (
+            f'<div class="zn {on}"><div class="zt">{title} {fmt(mid)} ± {band:g}%</div>'
+            f'<div class="zr">進場區 <b>{fmt(lo)} ～ {fmt(hi)}</b></div>'
+            f'<div class="zh">{zone_hint(info["price"], lo, hi)}</div>'
+            f'<div class="zc">{stop_line}</div>'
+            f'<div class="zc">以 {fmt(mid)} 進場 → 1/3 停利 <b class="pos">{fmt(tpp)}</b></div></div>'
+        )
+    return (
+        '<div class="stg"><div class="stg-h">策略 1｜突破後回測　'
+        f'<span class="stg-st">{html.escape(info["state"])}</span></div>'
+        f'<div class="zns">{block("壓力價", "res")}{block("支撐價", "sup")}</div></div>'
+    )
+
+
+def calc_html(entry, stop, tp):
+    if entry <= 0:
+        return '<div class="calc">請輸入進場價</div>'
+    tpp = tick_round(entry * (1 + tp))
+    tp_part = f'<span>1/3 停利價 <b class="pos">{fmt(tpp)}</b>（+{tp * 100:g}%）</span>'
+    if stop <= 0:
+        return f'<div class="calc">{tp_part}<span class="muted">請輸入停損價（突破 K 棒低點下數檔）</span></div>'
+    if stop >= entry:
+        return f'<div class="calc"><span class="neg">停損價需低於進場價</span>{tp_part}</div>'
+    risk = entry - stop
+    return (
+        '<div class="calc">'
+        f'<span>停損價 <b class="neg">{fmt(stop)}</b></span>{tp_part}'
+        f'<span>每股風險 <b>{fmt(risk)}</b>（{risk / entry * 100:.1f}%）</span>'
+        f'<span>每股目標獲利 <b>{fmt(tpp - entry)}</b></span>'
+        f'<span>報酬風險比 <b>{(tpp - entry) / risk:.1f} : 1</b></span></div>'
     )
 
 
@@ -555,18 +740,18 @@ if st.sidebar.button("🔄 重新載入清單"):
 
 try:
     if uploaded:
-        df = load_csv(uploaded)
+        df, FETCHED_AT = load_csv(uploaded)
     elif sheet_url:
         try:
-            df = load_csv(sheet_url)
+            df, FETCHED_AT = load_csv(sheet_url)
         except Exception as e1:
             st.sidebar.warning(
                 f"Google Sheet 讀取失敗（{type(e1).__name__}），已改用本機檔案。"
                 "請確認試算表已設為「知道連結的任何人都能檢視」。"
             )
-            df = load_csv(path)
+            df, FETCHED_AT = load_csv(path)
     else:
-        df = load_csv(path)
+        df, FETCHED_AT = load_csv(path)
 except Exception as e:
     st.sidebar.error(f"讀取失敗：{e}")
     st.info("請上傳 CSV、貼上 Google Sheet 連結，或填入正確的本機路徑。")
@@ -599,7 +784,6 @@ def has(colkey, text):
 # ------------------------------------------------------------------
 # 頂部：分類熱度 + 篩選欄
 # ------------------------------------------------------------------
-st.title("股票戰情室")
 mask = pd.Series(True, index=df.index)
 
 # 1) 分類「當天漲跌」平均熱度（以全部標的計算，不受篩選影響）
@@ -664,11 +848,6 @@ if all(cols[k] for k in ("brk", "op", "season", "month", "vol", "kbar")):
                 f'{chg_span(chg_num(row_, cols))}</span>'
             )
         st.markdown("".join(pills), unsafe_allow_html=True)
-        st.markdown(
-            f'<div style="background:#fff7e0;border:1px solid #ecd9a0;border-radius:10px;padding:10px 14px;'
-            f'color:#5a4a10;font-size:14px;margin:4px 0 8px">💡 {GATE_TIP}</div>',
-            unsafe_allow_html=True,
-        )
     else:
         st.info("目前沒有標的通過四道關卡。")
 
@@ -681,7 +860,7 @@ else:
     df["_score"], df["_trigB"], df["_ratio"] = 0, 0, 0.0
     st.info("缺少 突破狀態／操作建議／季線／月線／量價／當天強弱 其中某些欄位，無法執行關卡篩選。")
 
-# 2) 備註 / 狀態判斷 / 突破狀態 篩選器
+# 2) 搜尋
 st.markdown("##### 🔎 篩選")
 q = st.text_input(
     "🔍 搜尋代號或股票名稱",
@@ -696,30 +875,6 @@ if terms:
             h_ |= df[cols["name"]].fillna("").str.contains(t, case=False, regex=False)
         hit |= h_
     mask &= hit
-
-f1, f2, f3 = st.columns(3)
-
-if cols["note"]:
-    NO_NOTE = "（無備註）"
-    opts = sorted(str(x) for x in df[cols["note"]].dropna().unique() if str(x).strip()) + [NO_NOTE]
-    sel = f1.multiselect("備註", opts)
-    if sel:
-        m_ = df[cols["note"]].isin([x for x in sel if x != NO_NOTE])
-        if NO_NOTE in sel:
-            m_ |= df[cols["note"]].fillna("").str.strip() == ""
-        mask &= m_
-
-if cols["status"]:
-    opts = sorted(x for x in df[cols["status"]].dropna().unique() if x.strip())
-    sel = f2.multiselect("狀態判斷", opts)
-    if sel:
-        mask &= df[cols["status"]].isin(sel)
-
-if cols["brk"]:
-    opts = sorted(x for x in df[cols["brk"]].dropna().unique() if x.strip())
-    sel = f3.multiselect("突破狀態 / 日期", opts)
-    if sel:
-        mask &= df[cols["brk"]].isin(sel)
 
 # 3) 一鍵：只看「回測買點」
 if "only_retest" not in st.session_state:
@@ -780,6 +935,28 @@ if cols["cat"]:
     if sel:
         mask &= df[cols["cat"]].isin(sel)
 
+if cols["note"]:
+    NO_NOTE = "（無備註）"
+    opts = sorted(str(x) for x in df[cols["note"]].dropna().unique() if str(x).strip()) + [NO_NOTE]
+    sel = st.sidebar.multiselect("備註", opts)
+    if sel:
+        m_ = df[cols["note"]].isin([x for x in sel if x != NO_NOTE])
+        if NO_NOTE in sel:
+            m_ |= df[cols["note"]].fillna("").str.strip() == ""
+        mask &= m_
+
+if cols["status"]:
+    opts = sorted(x for x in df[cols["status"]].dropna().unique() if x.strip())
+    sel = st.sidebar.multiselect("狀態判斷", opts)
+    if sel:
+        mask &= df[cols["status"]].isin(sel)
+
+if cols["brk"]:
+    opts = sorted(x for x in df[cols["brk"]].dropna().unique() if x.strip())
+    sel = st.sidebar.multiselect("突破狀態 / 日期", opts)
+    if sel:
+        mask &= df[cols["brk"]].isin(sel)
+
 if st.sidebar.checkbox("✅ 套用 30 秒 SOP 快篩", help="季線安全 → 量價 → K 棒，三關全過才顯示"):
     gate1 = (has("season", "上揚") | has("season", "走平")) & has("season", "位階安全")
     brk_ok = ((has("brk", "今日突破") | has("brk", "昨日突破"))
@@ -816,6 +993,24 @@ mm[0].metric("符合條件", f"{len(view)} / {len(df)}")
 mm[1].metric("強勢突破", count("status", "強勢突破"))
 mm[2].metric("回測買點", count("op", "回測買點"))
 mm[3].metric("跌破支撐", count("status", "跌破支撐"))
+st.markdown('<div class="mini-title">股票戰情室</div>', unsafe_allow_html=True)
+
+with st.expander("📐 交易策略：條件與參數", expanded=False):
+    p1, p2, p3, p4 = st.columns(4)
+    band_pct = p1.number_input("進場區間 ±（%）", min_value=0.1, max_value=10.0, value=1.0, step=0.1)
+    tp_pct = p2.number_input("1/3 停利 +（%）", min_value=1.0, max_value=100.0, value=10.0, step=1.0)
+    n_ticks = p3.number_input("停損：K 棒低點下移（檔）", min_value=0, max_value=10, value=3, step=1)
+    big_mult = p4.number_input("大量門檻（× 前 20 日均量）", min_value=1.0, max_value=5.0, value=1.5, step=0.1)
+    st.markdown(
+        "**符合條件才會在個股下方出現「交易策略」（依試算表欄位判斷）**\n\n"
+        "1. 突破狀態／日期含「今日突破、昨日突破、已突破」或「回測支撐」，或操作建議含「回測買點」。\n"
+        "2. **策略 1｜突破後回測**：現價 ≥ 壓力價 → 已突破・站穩壓力價；"
+        "現價 ≤ 支撐價 × (1 + 進場區間) → 跌回支撐價；其餘 → 突破後回測中。\n"
+        "3. **進場區**＝支撐價或壓力價的上下 ±進場區間 %，自動算出價位（依台股跳動單位取整）。\n"
+        "4. **停損價**＝突破該價位的那根日 K（優先選成交量 ≥ 前 20 日均量 × 大量門檻者）的低點，往下移 N 檔。"
+        "在策略面板勾選「自動抓取」才會下載歷史 K 線；找不到時請手動輸入。\n"
+        "5. **1/3 停利價**＝進場價 × (1 + 停利 %)。"
+    )
 
 if view.empty:
     st.warning("沒有符合條件的標的，請放寬左側篩選。")
@@ -882,6 +1077,37 @@ def _cols2():
 hl, _h1 = _cols2()
 hl.markdown(HEADER_HTML, unsafe_allow_html=True)
 
+def render_strategy(code, info):
+    price = info["price"]
+    use_auto = st.checkbox(
+        "🔍 自動抓取歷史 K 線，找突破 K 棒（量大優先）算停損", value=False, key=f"auto_{code}",
+        help="會下載該股近半年日 K，可能多花幾秒；抓不到時請手動輸入停損價。",
+    )
+    bars = None
+    if use_auto:
+        try:
+            data, _ticker = fetch_history(code)
+            bars = {
+                "res": find_breakout_bar(data, info["zones"]["res"][1], big_mult),
+                "sup": find_breakout_bar(data, info["zones"]["sup"][1], big_mult),
+            }
+        except Exception:
+            st.warning("抓不到這檔的歷史 K 線，請手動輸入停損價。")
+            bars = {"res": None, "sup": None}
+    stops = compute_stops(bars, int(n_ticks))
+    st.markdown(strategy_html(info, band_pct, tp_pct / 100, bars, int(n_ticks)), unsafe_allow_html=True)
+
+    default_stop = stops["res"] if info["focus"] in ("res", "both") else stops["sup"]
+    default_stop = default_stop or stops["res"] or stops["sup"] or 0.0
+    step = float(tick_size(price))
+    c_in, c_stop, c_out = st.columns([1, 1, 2.6])
+    entry = c_in.number_input("手動輸入進場價", min_value=0.0, value=float(price), step=step,
+                              format="%.2f", key=f"man_{code}")
+    stop_in = c_stop.number_input("停損價（可改）", min_value=0.0, value=float(default_stop), step=step,
+                                  format="%.2f", key=f"stop_{code}_{default_stop}")
+    c_out.markdown(calc_html(float(entry), float(stop_in), tp_pct / 100), unsafe_allow_html=True)
+
+
 for i, row in chunk.iterrows():
     code = g(row, cols, "code")
     left, right = _cols2()
@@ -892,6 +1118,10 @@ for i, row in chunk.iterrows():
         is_open = st.session_state.open_code == code
         st.button("▲ 收起線圖" if is_open else "📈 內嵌線圖", key=f"b_{i}_{code}",
                   on_click=toggle, args=(code,), use_container_width=True)
+    info = strategy_info(row, cols, band_pct)
+    if info:
+        with st.expander(f"📌 交易策略｜{info['state']}｜{zone_label(info)}"):
+            render_strategy(code, info)
     if st.session_state.open_code == code:
         with st.container(border=True):
             render_chart(row)
