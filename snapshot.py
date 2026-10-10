@@ -29,14 +29,30 @@ def num(s):
 
 
 def read_sheet(src):
+    ctype = ""
     if src.startswith("http"):
-        r = requests.get(src, timeout=30)
+        r = requests.get(src, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+        ctype = r.headers.get("content-type", "")
+        print(f"下載狀態 {r.status_code}｜內容類型 {ctype}｜大小 {len(r.content)} bytes")
         r.raise_for_status()
         text = r.content.decode("utf-8-sig")
     else:
         with open(src, encoding="utf-8-sig") as f:
             text = f.read()
-    df = pd.read_csv(io.StringIO(text), dtype=str)
+
+    head = text.lstrip()[:15].lower()
+    if head.startswith("<!doctype") or head.startswith("<html") or "text/html" in ctype:
+        sys.exit("下載到的是網頁（HTML），不是 CSV。可能原因：SHEET_URL 不是 export?format=csv 開頭的連結、"
+                 "試算表沒有開放「知道連結的任何人都能檢視」，或 Google 擋掉了這次連線。")
+    lines = text.splitlines()
+    first = (lines[0] if lines else "")[:60]
+    print(f"內容共 {len(lines)} 行；第一行開頭：{first}")
+
+    try:
+        df = pd.read_csv(io.StringIO(text), dtype=str)
+    except pd.errors.ParserError as e:
+        sys.exit("這個連結的內容不是觀察清單的 CSV（欄位數對不上），很可能是別的分頁，請確認連結最後的 gid= 是觀察清單那一頁。"
+                 f"\n原始錯誤：{e}")
     if df.columns[0] in ("", "Unnamed: 0"):
         df = df.rename(columns={df.columns[0]: "備註"})
     keep = [c for c in df.columns
