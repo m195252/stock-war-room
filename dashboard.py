@@ -4,6 +4,8 @@
 """
 import datetime as dt
 import html
+import io
+import os
 import re
 
 import pandas as pd
@@ -733,6 +735,139 @@ def calc_html(entry, stop, tp):
     )
 
 
+# ------------------------------------------------------------------
+# 策略績效追蹤：每日快照 → 以當日收盤買進，到現在的報酬與勝率
+# ------------------------------------------------------------------
+DEFAULT_HISTORY_URL = "https://raw.githubusercontent.com/m195252/stock-war-room/main/history/snapshots.csv"
+
+
+@st.cache_data(ttl=600, show_spinner="讀取每日快照…")
+def load_history(src):
+    """讀取每日快照並用「目前的關卡規則」評分。沒有快照檔回傳 None。"""
+    if src.startswith("http"):
+        r = requests.get(src, timeout=20)
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        text = r.content.decode("utf-8-sig")
+    else:
+        if not os.path.exists(src):
+            return None
+        with open(src, encoding="utf-8-sig") as f:
+            text = f.read()
+    raw = pd.read_csv(io.StringIO(text), dtype=str)
+    hc = {k: pick_col(raw, k) for k in COL_CANDIDATES}
+    if "date" not in raw.columns or not (hc["code"] and hc["price"]):
+        return pd.DataFrame(columns=["date", "code", "name", "cat", "score", "trig", "entry"])
+    for k in ("support", "resistance", "price"):
+        if hc[k]:
+            raw[hc[k]] = to_num(raw[hc[k]])
+    out = []
+    for _, row_ in raw.iterrows():
+        entry = row_[hc["price"]]
+        if pd.isna(entry) or entry <= 0:
+            continue
+        g_ = eval_gates(row_, hc)
+        sc = gate_score(g_)
+        if sc < 1:
+            continue
+        out.append({
+            "date": str(row_["date"]), "code": str(row_[hc["code"]]).strip(),
+            "name": g(row_, hc, "name"), "cat": g(row_, hc, "cat"),
+            "score": sc, "trig": g_["trigger"], "entry": float(entry),
+        })
+    return pd.DataFrame(out, columns=["date", "code", "name", "cat", "score", "trig", "entry"])
+
+
+LEVEL_NAME = {4: "通過四關", 3: "通過三關", 2: "通過兩關", 1: "通過一關"}
+LEVEL_COLOR = {4: "#1f6b21", 3: "#4c8f3a", 2: "#a38a1c", 1: "#8b909a"}
+
+
+def render_perf(live, cols):
+    with st.expander("📈 策略績效追蹤：每日快照 → 收盤買進後的報酬與勝率", expanded=False):
+        url = _secret("HISTORY_URL", "") or DEFAULT_HISTORY_URL
+        try:
+            hist = load_history(url)
+        except Exception as e:
+            st.warning(f"讀取每日快照失敗（{type(e).__name__}），稍後再試。")
+            return
+        if hist is None or hist.empty:
+            st.info("目前還沒有每日快照。完成 GitHub Actions 設定後，每個交易日收盤後會自動存一份，"
+                    "有了第一份快照，這裡就會開始統計。")
+            return
+
+        live_px = dict(zip(live[cols["code"]], live[cols["price"]]))
+        h = hist.copy()
+        h["now"] = h["code"].map(live_px)
+        h = h.dropna(subset=["now"])
+        h["ret"] = (h["now"] / h["entry"] - 1) * 100
+        today = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=8)).date()
+        h["days"] = h["date"].map(lambda d_: (today - pd.to_datetime(d_).date()).days)
+
+        n_days = hist["date"].nunique()
+        st.caption(f"快照 {n_days} 天（{hist['date'].min()} ～ {hist['date'].max()}）｜"
+                   f"買進價＝快照當天的「目前股價」（收盤後存＝收盤價）｜現價取自目前試算表｜"
+                   f"勝率＝目前報酬 > 0 的比例｜未計手續費與證交稅")
+
+        c1, c2 = st.columns(2)
+        mode = c1.radio("統計方式", ["各關卡獨立（剛好通過 N 關）", "累計（至少通過 N 關）"], horizontal=True)
+        first_only = c2.checkbox("同一檔、同一關卡只算第一次出現", value=False,
+                                 help="連續好幾天都出現的股票，預設每天都算一筆；勾選後只算第一次。")
+        if first_only:
+            h = h.sort_values("date").drop_duplicates(["code", "score"], keep="first")
+        exact = mode.startswith("各關卡")
+
+        rows_ = []
+        for lv in (4, 3, 2, 1):
+            sub = h[h["score"] == lv] if exact else h[h["score"] >= lv]
+            label = LEVEL_NAME[lv] if exact else f"至少通過 {lv} 關"
+            if sub.empty:
+                rows_.append({"關卡": label, "訊號數": 0, "勝率": "-", "平均報酬": "-", "中位數報酬": "-"})
+            else:
+                rows_.append({
+                    "關卡": label, "訊號數": len(sub),
+                    "勝率": f"{(sub['ret'] > 0).mean() * 100:.0f}%",
+                    "平均報酬": f"{sub['ret'].mean():+.2f}%",
+                    "中位數報酬": f"{sub['ret'].median():+.2f}%",
+                })
+        st.table(pd.DataFrame(rows_))
+
+        dates = sorted(h["date"].unique(), reverse=True)
+        pick = st.selectbox("看哪一天的名單", ["全部日期"] + dates)
+        sub = h if pick == "全部日期" else h[h["date"] == pick]
+        sub = sub.sort_values(["date", "score", "ret"], ascending=[False, False, False]).head(300)
+        if sub.empty:
+            st.info("這天沒有符合的標的。")
+            return
+        th = "text-align:left;padding:6px 8px;color:#6b7280;font-weight:500;border-bottom:1px solid #e3e5dc;"
+        body = []
+        for r_ in sub.itertuples():
+            lc = LEVEL_COLOR[r_.score]
+            body.append(
+                '<tr style="border-bottom:1px solid #eceee8">'
+                f'<td style="padding:6px 8px">{html.escape(r_.date)}</td>'
+                f'<td style="padding:6px 8px"><span style="background:{lc};color:#fff;border-radius:10px;'
+                f'padding:1px 9px;font-size:12px">{LEVEL_NAME[r_.score]}</span></td>'
+                f'<td style="padding:6px 8px"><b>{html.escape(r_.name)}</b> '
+                f'<span style="color:#8b909a">{html.escape(r_.code)}</span></td>'
+                f'<td style="padding:6px 8px;color:#6b7280">{html.escape(r_.cat)}</td>'
+                f'<td style="padding:6px 8px">{"突破" if r_.trig == "A" else "回測"}</td>'
+                f'<td style="padding:6px 8px">{fmt(r_.entry)}</td>'
+                f'<td style="padding:6px 8px">{fmt(r_.now)}</td>'
+                f'<td style="padding:6px 8px;font-weight:600">{chg_span(r_.ret)}</td>'
+                f'<td style="padding:6px 8px;color:#6b7280">{r_.days} 天</td></tr>'
+            )
+        st.markdown(
+            '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:14px;'
+            'background:#fff;color:#1f2933">'
+            f'<thead><tr><th style="{th}">快照日</th><th style="{th}">關卡</th><th style="{th}">股票</th>'
+            f'<th style="{th}">分類</th><th style="{th}">觸發</th><th style="{th}">買進價</th>'
+            f'<th style="{th}">現價</th><th style="{th}">報酬</th><th style="{th}">持有</th></tr></thead>'
+            f'<tbody>{"".join(body)}</tbody></table></div>',
+            unsafe_allow_html=True,
+        )
+
+
 st.markdown(CSS, unsafe_allow_html=True)
 
 # ------------------------------------------------------------------
@@ -903,6 +1038,8 @@ else:
     passed_codes, gate_map = set(), {}
     df["_score"], df["_trigB"], df["_ratio"] = 0, 0, 0.0
     st.info("缺少 突破狀態／操作建議／季線／月線／量價／當天強弱 其中某些欄位，無法執行關卡篩選。")
+
+render_perf(df, cols)
 
 # 2) 搜尋
 st.markdown("##### 🔎 篩選")
