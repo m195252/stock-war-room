@@ -1,0 +1,31 @@
+name: daily-snapshot
+
+on:
+  schedule:
+    - cron: "10 6 * * 1-5"   # 世界標準時間 06:10 = 台北 14:10，週一到週五
+  workflow_dispatch:           # 也可以到 Actions 頁面手動按 Run workflow
+
+permissions:
+  contents: write
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pandas requests
+      - name: Take snapshot
+        env:
+          SHEET_URL: ${{ secrets.SHEET_URL }}
+        run: python snapshot.py
+      - name: Commit snapshot
+        run: |
+          git config user.name "snapshot-bot"
+          git config user.email "snapshot-bot@users.noreply.github.com"
+          git add history/snapshots.csv || true
+          git diff --cached --quiet || git commit -m "snapshot $(date -u +%F)"
+          git push
