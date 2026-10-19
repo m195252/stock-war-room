@@ -268,6 +268,8 @@ CSS = """
   div[data-testid="stColumn"]:has([data-testid="stLinkButton"]) [data-testid="stElementContainer"],
   div[data-testid="column"]:has([data-testid="stLinkButton"]) [data-testid="element-container"]{flex:1;}
 }
+.refwrap{opacity:.72;}
+.reftag{font-size:11px;color:#8b909a;border:1px dashed #c3c7cf;border-radius:8px;padding:0 6px;margin-right:6px;white-space:nowrap;}
 </style>
 """
 
@@ -337,7 +339,7 @@ def eval_gates(row, cols, b_relax_month=False, b_relax_season=False):
         if not month_ok:
             why.append("月線不在上方／未守穩")
         r["g2_reason"] = "、".join(why)
-        return r
+        # 不 return：第三、四關仍照樣評估，供畫面參考；計分與是否通過仍依序判斷
 
     # 第三關：量價
     if r["trigger"] == "A":
@@ -371,7 +373,7 @@ def eval_gates(row, cols, b_relax_month=False, b_relax_season=False):
         else:
             r["g4"] = (False, "回測需強力收腳或略有支撐")
 
-    r["passed"] = r["g3"][0] and r["g4"][0]
+    r["passed"] = bool(r["g2"] and r["g3"][0] and r["g4"][0])
     return r
 
 
@@ -532,12 +534,19 @@ def row_html(row, cols, gate):
         c2 = na
     price_txt = fmt(price) if price is not None else "-"
     c3 = f'<b>{price_txt}</b><div>{chg_span(cv)}</div>'
-    if gate["g2"]:
-        c4 = f'<span>{e(clean_vol(gate["g3_text"]) or "-")}</span> {badge(*gate["g3"])}'
-        c5 = (f'<span class="kb">{candle_svg(gate["g4_text"], cv)}'
-              f'<span>{e(clean_kbar(gate["g4_text"]) or "-")}</span></span> {badge(*gate["g4"])}')
-    else:
-        c4 = c5 = na
+    vol_txt = e(clean_vol(gate["g3_text"]) or "-")
+    kb_inner = (f'<span class="kb">{candle_svg(gate["g4_text"], cv)}'
+                f'<span>{e(clean_kbar(gate["g4_text"]) or "-")}</span></span>')
+    if not trig:                      # 沒有啟動條件：只列出原始標籤，不判定
+        c4 = f'<span class="gna">{vol_txt}</span>'
+        c5 = kb_inner
+    elif gate["g2"]:
+        c4 = f'<span>{vol_txt}</span> {badge(*gate["g3"])}'
+        c5 = f'{kb_inner} {badge(*gate["g4"])}'
+    else:                             # 第二關已淘汰：第三、四關結果僅供參考
+        tag_ref = '<span class="reftag" title="第二關未通過，以下僅供參考，不計入關卡">參考</span>'
+        c4 = f'<span class="refwrap">{tag_ref}<span>{vol_txt}</span> {badge(*gate["g3"])}</span>'
+        c5 = f'<span class="refwrap">{tag_ref}{kb_inner} {badge(*gate["g4"])}</span>'
 
     # ---- 支撐壓力價格條 + 與支撐／壓力的乖離率 ----
     ok = all(v is not None and pd.notna(v) for v in (sup, res, price)) and res > sup
@@ -1073,7 +1082,7 @@ def render_gate_panel(results, relax_m, relax_s):
             sub = [(row_, r_) for row_, r_ in results if r_["trigger"] == key]
             n1 = len(sub)
             n2 = sum(1 for _, r_ in sub if r_["g2"])
-            n3 = sum(1 for _, r_ in sub if r_["g3"][0])
+            n3 = sum(1 for _, r_ in sub if r_["g2"] and r_["g3"][0])
             n4 = sum(1 for _, r_ in sub if r_["passed"])
             rows_.append({"類型": label, "第一關（觸發）": n1, "通過第二關": n2, "通過第三關": n3, "通過第四關": n4})
             c2_ = Counter(x for _, r_ in sub if not r_["g2"] for x in r_["g2_reason"].split("、") if x)
@@ -1556,10 +1565,14 @@ if view.empty:
     st.stop()
 
 c1, c2 = st.columns([1, 1])
-page_size = c1.selectbox("每頁顯示", [20, 50, 100, 500], index=0)
-pages = max(1, -(-len(view) // page_size))
-page = c2.number_input("頁碼", min_value=1, max_value=pages, value=1, step=1)
-chunk = view.iloc[(page - 1) * page_size: page * page_size]
+page_size = c1.selectbox("每頁顯示", ["全部", 20, 50, 100], index=0)
+if page_size == "全部":
+    pages, page = 1, 1
+    chunk = view
+else:
+    pages = max(1, -(-len(view) // page_size))
+    page = c2.number_input("頁碼", min_value=1, max_value=pages, value=1, step=1)
+    chunk = view.iloc[(page - 1) * page_size: page * page_size]
 
 hl, _h1 = _cols2()
 hl.markdown(HEADER_HTML, unsafe_allow_html=True)
