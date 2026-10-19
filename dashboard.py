@@ -295,7 +295,7 @@ def fmt(v):
 
 
 
-def eval_gates(row, cols):
+def eval_gates(row, cols, b_relax_month=False, b_relax_season=False):
     """四道關卡（CSV 模式，依序過濾）。回傳各關結果與未通過原因。"""
     brk, op = g(row, cols, "brk"), g(row, cols, "op")
     season, month = g(row, cols, "season"), g(row, cols, "month")
@@ -326,6 +326,9 @@ def eval_gates(row, cols):
     # 第二關：大環境（季線之上 且 月線之上／守穩回測）
     season_ok = bool(r["season_above"])
     month_ok = ("月線之上" in month) or ("守穩回測" in month)
+    if r["trigger"] == "B":          # 回測：可在側邊欄放寬第二關
+        season_ok = season_ok or b_relax_season
+        month_ok = month_ok or b_relax_month
     r["g2"] = season_ok and month_ok
     if not r["g2"]:
         why = []
@@ -742,7 +745,7 @@ DEFAULT_HISTORY_URL = "https://raw.githubusercontent.com/m195252/stock-war-room/
 
 
 @st.cache_data(ttl=600, show_spinner="讀取每日快照…")
-def load_history(src):
+def load_history(src, b_relax_month=False, b_relax_season=False):
     """讀取每日快照並用「目前的關卡規則」評分。沒有快照檔回傳 None。"""
     if src.startswith("http"):
         r = requests.get(src, timeout=20)
@@ -758,7 +761,7 @@ def load_history(src):
     raw = pd.read_csv(io.StringIO(text), dtype=str)
     hc = {k: pick_col(raw, k) for k in COL_CANDIDATES}
     if "date" not in raw.columns or not (hc["code"] and hc["price"]):
-        return pd.DataFrame(columns=["date", "code", "name", "cat", "score", "trig", "entry"])
+        return pd.DataFrame(columns=["date", "code", "name", "cat", "score", "trig", "entry", "sup", "res"])
     for k in ("support", "resistance", "price"):
         if hc[k]:
             raw[hc[k]] = to_num(raw[hc[k]])
@@ -767,7 +770,7 @@ def load_history(src):
         entry = row_[hc["price"]]
         if pd.isna(entry) or entry <= 0:
             continue
-        g_ = eval_gates(row_, hc)
+        g_ = eval_gates(row_, hc, b_relax_month, b_relax_season)
         sc = gate_score(g_)
         if sc < 1:
             continue
@@ -775,19 +778,21 @@ def load_history(src):
             "date": str(row_["date"]), "code": str(row_[hc["code"]]).strip(),
             "name": g(row_, hc, "name"), "cat": g(row_, hc, "cat"),
             "score": sc, "trig": g_["trigger"], "entry": float(entry),
+            "sup": row_[hc["support"]] if hc["support"] else float("nan"),
+            "res": row_[hc["resistance"]] if hc["resistance"] else float("nan"),
         })
-    return pd.DataFrame(out, columns=["date", "code", "name", "cat", "score", "trig", "entry"])
+    return pd.DataFrame(out, columns=["date", "code", "name", "cat", "score", "trig", "entry", "sup", "res"])
 
 
 LEVEL_NAME = {4: "通過四關", 3: "通過三關", 2: "通過兩關", 1: "通過一關"}
 LEVEL_COLOR = {4: "#1f6b21", 3: "#4c8f3a", 2: "#a38a1c", 1: "#8b909a"}
 
 
-def render_perf(live, cols):
+def render_perf(live, cols, relax_m=False, relax_s=False):
     with st.expander("📈 策略績效追蹤：每日快照 → 收盤買進後的報酬與勝率", expanded=False):
         url = _secret("HISTORY_URL", "") or DEFAULT_HISTORY_URL
         try:
-            hist = load_history(url)
+            hist = load_history(url, relax_m, relax_s)
         except Exception as e:
             st.warning(f"讀取每日快照失敗（{type(e).__name__}），稍後再試。")
             return
@@ -832,6 +837,9 @@ def render_perf(live, cols):
                 })
         st.table(pd.DataFrame(rows_))
 
+        st.markdown("---")
+        backtest_section(hist)
+        st.markdown("---")
         dates = sorted(h["date"].unique(), reverse=True)
         pick = st.selectbox("看哪一天的名單", ["全部日期"] + dates)
         sub = h if pick == "全部日期" else h[h["date"] == pick]
@@ -866,6 +874,225 @@ def render_perf(live, cols):
             f'<tbody>{"".join(body)}</tbody></table></div>',
             unsafe_allow_html=True,
         )
+
+
+# ------------------------------------------------------------------
+# 策略回測：突破後回測買入，+10% 賣 1/3、破 5 日線賣 1/3、破 20 日線賣 1/3、
+#           跌破「突破 K 棒低點下 N 檔」全數停損
+# ------------------------------------------------------------------
+def simulate_trade(data, entry_date, entry, stop, tp, ma_fast=5, ma_slow=20):
+    """以日 K 模擬一筆交易。找不到進場當天的 K 線回傳 None。
+    規則：每個出場條件各占 1/3；同一天先檢查停損（保守）；
+    破均線＝先站上均線後，收盤再跌破（進場時已在均線下，需先站回均線）。"""
+    d = data.sort_values("time").reset_index(drop=True).copy()
+    d["time"] = pd.to_datetime(d["time"])
+    d["ma_f"] = d["close"].rolling(ma_fast).mean()
+    d["ma_s"] = d["close"].rolling(ma_slow).mean()
+    hit = d.index[d["time"].dt.date == entry_date]
+    if len(hit) == 0:
+        return None
+    i0 = int(hit[0])
+    target = entry * (1 + tp)
+    exits, why = [None, None, None], ["", "", ""]
+    armed_f = bool(pd.notna(d.at[i0, "ma_f"]) and d.at[i0, "close"] >= d.at[i0, "ma_f"])
+    armed_s = bool(pd.notna(d.at[i0, "ma_s"]) and d.at[i0, "close"] >= d.at[i0, "ma_s"])
+    status = "持有中"
+    for j in range(i0 + 1, len(d)):
+        o, h_, l_, c_ = (float(d.at[j, k]) for k in ("open", "high", "low", "close"))
+        if stop and l_ <= stop:
+            fill = min(o, stop)
+            for k in range(3):
+                if exits[k] is None:
+                    exits[k], why[k] = fill, "停損"
+            status = "停損出場"
+            break
+        if exits[0] is None and h_ >= target:
+            exits[0], why[0] = max(o, target), "停利"
+        mf, ms = d.at[j, "ma_f"], d.at[j, "ma_s"]
+        if pd.notna(mf):
+            if exits[1] is None and armed_f and c_ < mf:
+                exits[1], why[1] = c_, "破5日線"
+            armed_f = c_ >= mf
+        if pd.notna(ms):
+            if exits[2] is None and armed_s and c_ < ms:
+                exits[2], why[2] = c_, "破20日線"
+            armed_s = c_ >= ms
+        if all(e is not None for e in exits):
+            status = "全部出場"
+            break
+    last = float(d["close"].iloc[-1])
+    n_open = sum(e is None for e in exits)
+    rets, parts = [], []
+    for k in range(3):
+        px = exits[k] if exits[k] is not None else last
+        r_ = (px / entry - 1) * 100
+        rets.append(r_)
+        parts.append(f"{why[k] or '持有'} {r_:+.1f}%")
+    if status == "持有中" and n_open < 3:
+        status = "部分出場，持有中"
+    return {"ret": sum(rets) / 3, "status": status, "detail": "｜".join(parts)}
+
+
+def run_backtest(sigs, n_ticks_, big_mult_, tp, prog):
+    rows_ = []
+    codes = list(sigs["code"].unique())
+    data_map = {}
+    for i, code_ in enumerate(codes):
+        prog.progress((i + 1) / max(len(codes), 1), text=f"抓取歷史 K 線 {i + 1}/{len(codes)}：{code_}")
+        try:
+            data_map[code_] = fetch_history(code_)[0]
+        except Exception:
+            data_map[code_] = None
+    for r_ in sigs.itertuples():
+        base = {"date": r_.date, "name": r_.name, "code": r_.code, "score": r_.score,
+                "trig": r_.trig, "entry": r_.entry, "stop": None}
+        data = data_map.get(r_.code)
+        if data is None:
+            rows_.append({**base, "skip": "抓不到歷史 K 線"})
+            continue
+        edate = pd.to_datetime(r_.date).date()
+        upto = data[pd.to_datetime(data["time"]).dt.date <= edate]
+        stop = None
+        if pd.notna(r_.res) and pd.notna(r_.sup) and not upto.empty:
+            if r_.entry >= r_.res:
+                level = r_.res
+            elif r_.entry <= r_.sup * 1.01:
+                level = r_.sup
+            else:
+                level = r_.res
+            bar = find_breakout_bar(upto, level, big_mult_)
+            if bar:
+                s_ = ticks_down(bar["low"], n_ticks_)
+                if s_ < r_.entry:
+                    stop = s_
+        sim = simulate_trade(data, edate, r_.entry, stop, tp)
+        if sim is None:
+            rows_.append({**base, "skip": "找不到進場當天的 K 線"})
+            continue
+        rows_.append({**base, "stop": stop, "skip": "", **sim})
+    return pd.DataFrame(rows_)
+
+
+def backtest_section(hist):
+    st.markdown("#### 🧪 策略回測：突破後回測買入＋分批出場")
+    st.caption("買進＝快照當天收盤價｜出場：+停利% 賣 1/3、收盤跌破 5 日線賣 1/3、收盤跌破 20 日線賣 1/3｜"
+               "跌破「突破 K 棒低點下 N 檔」（量大優先，找不到就不設停損）全數停損出場｜"
+               "同一天先檢查停損；用日 K 模擬，未計手續費與證交稅；未出場的部分以最新收盤價計。")
+    c1, c2 = st.columns(2)
+    kind = c1.selectbox("進場訊號", ["回測（突破後回測買入）", "突破", "全部"])
+    min_lv = c2.selectbox("至少通過關卡", [1, 2, 3, 4], index=0)
+    sigs = hist[hist["score"] >= min_lv]
+    if kind.startswith("回測"):
+        sigs = sigs[sigs["trig"] == "B"]
+    elif kind == "突破":
+        sigs = sigs[sigs["trig"] == "A"]
+    sigs = sigs.sort_values("date")
+    st.write(f"符合的訊號：{len(sigs)} 筆（{sigs['code'].nunique()} 檔）")
+
+    if st.button("▶ 執行策略回測（會下載各股歷史 K 線）", key="run_bt"):
+        if sigs.empty:
+            st.info("沒有符合的訊號可回測。")
+        else:
+            prog = st.progress(0.0, text="準備中…")
+            st.session_state["bt_rows"] = run_backtest(sigs, int(n_ticks), float(big_mult), tp_pct / 100, prog)
+            st.session_state["bt_meta"] = f"{kind}｜至少 {min_lv} 關｜停利 {tp_pct:g}%｜停損下 {int(n_ticks)} 檔"
+            prog.empty()
+
+    res_ = st.session_state.get("bt_rows")
+    if res_ is None or res_.empty:
+        return
+    st.caption(f"上次回測設定：{st.session_state.get('bt_meta', '')}")
+    ok = res_[res_["skip"] == ""]
+    skipped = res_[res_["skip"] != ""]
+    if ok.empty:
+        st.info("沒有可計算的交易（可能是歷史 K 線還沒更新到進場日）。")
+    else:
+        stops = (ok["status"] == "停損出場").sum()
+        holding = ok["status"].str.contains("持有").sum()
+        st.table(pd.DataFrame([{
+            "有效筆數": len(ok), "勝率": f"{(ok['ret'] > 0).mean() * 100:.0f}%",
+            "平均報酬": f"{ok['ret'].mean():+.2f}%", "中位數報酬": f"{ok['ret'].median():+.2f}%",
+            "停損出場": int(stops), "仍持有": int(holding), "無停損價": int(ok["stop"].isna().sum()),
+        }]))
+    if not skipped.empty:
+        st.caption(f"略過 {len(skipped)} 筆：" + "、".join(sorted(set(skipped["skip"]))))
+    th = "text-align:left;padding:6px 8px;color:#6b7280;font-weight:500;border-bottom:1px solid #e3e5dc;"
+    body = []
+    for r_ in ok.sort_values(["date", "ret"], ascending=[False, False]).head(300).itertuples():
+        stop_txt = fmt(r_.stop) if pd.notna(r_.stop) else "—"
+        body.append(
+            '<tr style="border-bottom:1px solid #eceee8">'
+            f'<td style="padding:6px 8px">{html.escape(r_.date)}</td>'
+            f'<td style="padding:6px 8px"><b>{html.escape(r_.name)}</b> '
+            f'<span style="color:#8b909a">{html.escape(r_.code)}</span></td>'
+            f'<td style="padding:6px 8px">{"回測" if r_.trig == "B" else "突破"}・{r_.score}關</td>'
+            f'<td style="padding:6px 8px">{fmt(r_.entry)}</td><td style="padding:6px 8px">{stop_txt}</td>'
+            f'<td style="padding:6px 8px">{html.escape(r_.status)}</td>'
+            f'<td style="padding:6px 8px;color:#6b7280;font-size:12.5px">{html.escape(r_.detail)}</td>'
+            f'<td style="padding:6px 8px;font-weight:600">{chg_span(r_.ret)}</td></tr>'
+        )
+    if body:
+        st.markdown(
+            '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:14px;'
+            'background:#fff;color:#1f2933">'
+            f'<thead><tr><th style="{th}">進場日</th><th style="{th}">股票</th><th style="{th}">訊號</th>'
+            f'<th style="{th}">買進價</th><th style="{th}">停損價</th><th style="{th}">狀態</th>'
+            f'<th style="{th}">三份出場明細（停利／破5日／破20日）</th><th style="{th}">總報酬</th></tr></thead>'
+            f'<tbody>{"".join(body)}</tbody></table></div>', unsafe_allow_html=True)
+
+
+# ------------------------------------------------------------------
+# 第 1～4 關：條件說明 + 目前各關卡被擋的原因統計
+# ------------------------------------------------------------------
+def render_gate_panel(results, relax_m, relax_s):
+    from collections import Counter
+
+    with st.expander("📋 第 1～4 關篩選條件與目前結果", expanded=False):
+        note_s = "（回測已設定：不要求）" if relax_s else ""
+        note_m = "（回測已設定：不要求）" if relax_m else ""
+        st.markdown(
+            "**第一關：啟動條件**（讀「突破狀態/日期」「操作建議」）\n"
+            "- **B 回測**（優先）：突破狀態含「回測支撐」；或含「已突破／昨日突破」且操作建議含「回測買點」\n"
+            "- **A 突破**：突破狀態含「今日突破」\n"
+            "- 都不符合 → 剔除，後面不再判斷\n\n"
+            f"**第二關：大環境**（突破、回測相同，兩項都要成立）\n"
+            f"- 季線之上：現價 ≥ 季線價{note_s}\n"
+            f"- 月線：含「月線之上」或「守穩回測」{note_m}\n\n"
+            "**第三關：量價**（讀「量價」欄）\n"
+            "- A 突破：含「溫和放量」或「爆量警示」，且不含「量縮」「窒息量」\n"
+            "- B 回測：含「量縮／窒息量／溫和放量／正常量」其中之一，且不含「爆量警示」\n\n"
+            "**第四關：K 棒**（讀「當天強弱」欄）\n"
+            "- A 突破：必須「實體紅K」；含「實體殺盤」剔除\n"
+            "- B 回測：必須「強力收腳」或「略有支撐」；含「實體殺盤」剔除\n\n"
+            "依序過濾：前一關沒過就停在那一關。回測的第二關可在左側欄「關卡設定（回測）」放寬。"
+        )
+        if not results:
+            return
+        rows_, notes = [], []
+        for label, key in (("回測 B", "B"), ("突破 A", "A")):
+            sub = [(row_, r_) for row_, r_ in results if r_["trigger"] == key]
+            n1 = len(sub)
+            n2 = sum(1 for _, r_ in sub if r_["g2"])
+            n3 = sum(1 for _, r_ in sub if r_["g3"][0])
+            n4 = sum(1 for _, r_ in sub if r_["passed"])
+            rows_.append({"類型": label, "第一關（觸發）": n1, "通過第二關": n2, "通過第三關": n3, "通過第四關": n4})
+            c2_ = Counter(x for _, r_ in sub if not r_["g2"] for x in r_["g2_reason"].split("、") if x)
+            c3_ = Counter(r_["g3"][1] for _, r_ in sub if r_["g2"] and not r_["g3"][0])
+            c4_ = Counter(r_["g4"][1] for _, r_ in sub if r_["g2"] and r_["g3"][0] and not r_["g4"][0])
+            for gname, cnt in (("第二關", c2_), ("第三關", c3_), ("第四關", c4_)):
+                if cnt:
+                    notes.append(f"- {label}・{gname}被擋：" + "、".join(f"{k} {v} 檔" for k, v in cnt.most_common()))
+        st.markdown("**目前各關通過檔數**")
+        st.table(pd.DataFrame(rows_))
+        if notes:
+            st.markdown("**被擋原因統計**\n" + "\n".join(notes))
+        stuck = []
+        for row_, r_ in results:
+            if r_["trigger"] == "B" and not r_["passed"]:
+                sc = gate_score(r_)
+                stuck.append(f"{g(row_, cols, 'name')}（第{sc + 1}關：{stop_reason(r_)}）")
+        if stuck:
+            st.markdown("**回測類尚未通過的個股**\n\n" + "、".join(stuck[:40]))
 
 
 st.markdown(CSS, unsafe_allow_html=True)
@@ -974,7 +1201,12 @@ if cols["cat"] and cols["chg"]:
 # 關卡篩選器：四道關卡（依序過濾）
 # ------------------------------------------------------------------
 if all(cols[k] for k in ("brk", "op", "season", "month", "vol", "kbar")):
-    results = [(row_, eval_gates(row_, cols)) for _, row_ in df.iterrows()]
+    st.sidebar.markdown("**關卡設定（回測）**")
+    relax_m = st.sidebar.checkbox("回測：第二關不要求月線之上", value=False,
+                                  help="回測常常會跌到月線附近，勾選後回測類不再因月線被第二關淘汰。")
+    relax_s = st.sidebar.checkbox("回測：第二關不要求季線之上", value=False,
+                                  help="勾選後回測類不再因季線之下被第二關淘汰。")
+    results = [(row_, eval_gates(row_, cols, relax_m, relax_s)) for _, row_ in df.iterrows()]
     n_all = len(results)
     n1 = sum(1 for _, r_ in results if r_["trigger"])
     n2 = sum(1 for _, r_ in results if r_["g2"])
@@ -1035,11 +1267,10 @@ if all(cols[k] for k in ("brk", "op", "season", "month", "vol", "kbar")):
     df["_trigB"] = df[cols["code"]].map(lambda c_: 1 if gate_map[c_]["trigger"] == "B" else 0)
     df["_ratio"] = df[cols["code"]].map(lambda c_: vol_ratio(gate_map[c_]["g3_text"]))
 else:
+    results, relax_m, relax_s = [], False, False
     passed_codes, gate_map = set(), {}
     df["_score"], df["_trigB"], df["_ratio"] = 0, 0, 0.0
     st.info("缺少 突破狀態／操作建議／季線／月線／量價／當天強弱 其中某些欄位，無法執行關卡篩選。")
-
-render_perf(df, cols)
 
 # 2) 搜尋
 st.markdown("##### 🔎 篩選")
@@ -1192,6 +1423,9 @@ with st.expander("📐 交易策略：條件與參數", expanded=False):
         "在策略面板勾選「自動抓取」才會下載歷史 K 線；找不到時請手動輸入。\n"
         "5. **1/3 停利價**＝進場價 × (1 + 停利 %)。"
     )
+
+render_gate_panel(results, relax_m, relax_s)
+render_perf(df, cols, relax_m, relax_s)
 
 if "open_code" not in st.session_state:
     st.session_state.open_code = None
