@@ -1289,40 +1289,49 @@ if terms:
     mask &= hit
 
 # 3) 一鍵：只看「回測買點」
-if "only_retest" not in st.session_state:
-    st.session_state.only_retest = False
-n_retest = int(has("op", "回測買點").sum())
-
-
-def _toggle_retest():
-    st.session_state.only_retest = not st.session_state.only_retest
-
-
+# 訊號類型篩選：依「第一關」判定的類型（B 回測／A 突破），和下面的關卡按鈕可以疊加
+if "trig_filter" not in st.session_state:
+    st.session_state.trig_filter = None
 if "gate_level" not in st.session_state:
     st.session_state.gate_level = None
+
+
+def _set_trig(k):
+    st.session_state.trig_filter = None if st.session_state.trig_filter == k else k
 
 
 def _set_level(k):
     st.session_state.gate_level = None if st.session_state.gate_level == k else k
 
 
-on = st.session_state.only_retest
+tf = st.session_state.trig_filter
 lvl = st.session_state.gate_level
-bcs = st.columns(5)
+n_b = int((df["_trigB"] == 1).sum())
+n_a = int(((df["_score"] >= 1) & (df["_trigB"] == 0)).sum())
+bcs = st.columns(6)
 bcs[0].button(
-    f"✔ 回測買點（{n_retest}）" if on else f"🎯 回測買點（{n_retest}）",
-    on_click=_toggle_retest, type="primary" if on else "secondary",
-    key="btn_retest", use_container_width=True,
+    f"✔ 回測訊號（{n_b}）" if tf == "B" else f"🎯 回測訊號（{n_b}）",
+    on_click=_set_trig, args=("B",), type="primary" if tf == "B" else "secondary",
+    key="btn_trig_b", use_container_width=True,
+    help="第一關判定為「回測」的個股（突破狀態含回測支撐，或已突破／昨日突破且操作建議含回測買點）。",
+)
+bcs[1].button(
+    f"✔ 突破訊號（{n_a}）" if tf == "A" else f"🔥 突破訊號（{n_a}）",
+    on_click=_set_trig, args=("A",), type="primary" if tf == "A" else "secondary",
+    key="btn_trig_a", use_container_width=True,
+    help="第一關判定為「突破」的個股（突破狀態含今日突破）。",
 )
 for k_, label_ in ((1, "通過第一關"), (2, "通過第二關"), (3, "通過第三關"), (4, "✅ 通過四關")):
     n_k = int((df["_score"] >= k_).sum())
-    bcs[k_].button(
+    bcs[k_ + 1].button(
         f"✔ {label_}（{n_k}）" if lvl == k_ else f"{label_}（{n_k}）",
         on_click=_set_level, args=(k_,), type="primary" if lvl == k_ else "secondary",
         key=f"btn_gate{k_}", use_container_width=True,
     )
-if on:
-    mask &= has("op", "回測買點")
+if tf == "B":
+    mask &= df["_trigB"] == 1
+elif tf == "A":
+    mask &= (df["_score"] >= 1) & (df["_trigB"] == 0)
 if lvl:
     mask &= df["_score"] >= lvl
 
