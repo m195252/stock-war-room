@@ -37,6 +37,7 @@ COL_CANDIDATES = {
     "season": ["季線", "O欄季線"],
     "month": ["月線", "P欄月線"],
     "upd": ["上次更新日期", "更新日期", "更新時間", "最後更新", "更新"],
+    "lvl": ["本期改線日", "改線日", "最近改線日"],
 }
 PREFIX_FALLBACK = {"brk": "突破狀態", "dev": "乖離率", "support": "支撐", "resistance": "壓力"}
 
@@ -53,6 +54,18 @@ def pick_col(df, key):
     return None
 
 
+def norm_lvl(x):
+    """把「10/21」「2026/10/21」「2026-10-21」都整理成 MM/DD；看不懂回傳空字串。"""
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return ""
+    nums = re.findall(r"\d+", str(x))
+    if len(nums) >= 2:
+        m_, d_ = int(nums[-2]), int(nums[-1])
+        if 1 <= m_ <= 12 and 1 <= d_ <= 31:
+            return f"{m_:02d}/{d_:02d}"
+    return ""
+
+
 def to_num(s):
     return pd.to_numeric(s.astype(str).str.replace(",", "", regex=False), errors="coerce")
 
@@ -63,6 +76,7 @@ def _now_tw():
 
 
 FETCHED_AT = ""
+LATEST_LVL = ""
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -270,6 +284,8 @@ CSS = """
 }
 .refwrap{opacity:.72;}
 .reftag{font-size:11px;color:#8b909a;border:1px dashed #c3c7cf;border-radius:8px;padding:0 6px;margin-right:6px;white-space:nowrap;}
+.rw .cdb .lv{font-size:11px;color:#8b909a;white-space:nowrap;line-height:1.3;}
+.rw .cdb .lv.hot{color:#d9363e;font-weight:600;}
 </style>
 """
 
@@ -496,6 +512,8 @@ def row_html(row, cols, gate):
     res = row[cols["resistance"]] if cols["resistance"] else None
     cv = chg_num(row, cols)
     upd = g(row, cols, "upd") or FETCHED_AT
+    lv = g(row, cols, "lvl")
+    lv_html = (f'<div class="lv{" hot" if lv and lv == LATEST_LVL else ""}">改線 {e(lv)}</div>' if lv else "")
 
     # 名稱下方：分類・季線之上/之下・月線
     sa = gate.get("season_above")
@@ -579,7 +597,7 @@ def row_html(row, cols, gate):
     return (
         f'<div class="rw2 {cls}"><div class="rw">'
         f'<div class="c1"><div class="cdb"><div class="cd">{e(g(row, cols, "code"))}</div>'
-        f'<div class="up">更新 {e(upd)}</div></div>'
+        f'<div class="up">更新 {e(upd)}</div>{lv_html}</div>'
         f'<div class="nmb"><div class="l1"><b class="nm">{e(g(row, cols, "name"))}</b>{tag}</div>'
         f'<div class="sub">{sub}</div></div></div>'
         f'<div class="g-trig"><span class="ml">觸發</span>{c2}</div>'
@@ -1167,6 +1185,13 @@ for k in ("support", "resistance", "price"):
         df[cols[k]] = to_num(df[cols[k]])
 df["_dev"] = to_num(df[cols["dev"]].astype(str).str.replace("%", "", regex=False)) if cols["dev"] else float("nan")
 df["_chg"] = to_num(df[cols["chg"]].astype(str).str.replace("%", "", regex=False)) if cols["chg"] else float("nan")
+if cols["lvl"]:
+    df[cols["lvl"]] = df[cols["lvl"]].map(norm_lvl)
+    _lv = [x for x in df[cols["lvl"]] if x]
+    LATEST_LVL = max(_lv, key=lambda x: (int(x[:2]), int(x[3:]))) if _lv else ""
+    df["_lvkey"] = df[cols["lvl"]].map(lambda x: int(x[:2]) * 100 + int(x[3:]) if x else -1)
+else:
+    df["_lvkey"] = -1
 
 
 def has(colkey, text):
@@ -1297,7 +1322,20 @@ if terms:
         hit |= h_
     mask &= hit
 
-# 3) 一鍵：只看「回測買點」
+
+def _open_detail():
+    v_ = st.session_state.get("pick_detail") or ""
+    if v_:
+        st.session_state["dialog_code"] = v_.split(" ")[0]
+        st.session_state["pick_detail"] = ""
+
+
+_nm = df[cols["name"]].fillna("") if cols["name"] else df[cols["code"]]
+_opts = [""] + [f"{c_} {n_}" for c_, n_ in zip(df[cols["code"]], _nm)]
+st.selectbox("📂 開啟個股明細（輸入代號或名稱搜尋，不受下方篩選影響）", _opts,
+             key="pick_detail", on_change=_open_detail)
+
+# 3) 訊號類型與關卡按鈕
 # 訊號類型篩選：依「第一關」判定的類型（B 回測／A 突破），和下面的關卡按鈕可以疊加
 if "trig_filter" not in st.session_state:
     st.session_state.trig_filter = None
@@ -1387,6 +1425,16 @@ if cols["brk"]:
     if sel:
         mask &= df[cols["brk"]].isin(sel)
 
+if cols["lvl"]:
+    dts = sorted({x for x in df[cols["lvl"]] if x}, key=lambda x: (int(x[:2]), int(x[3:])), reverse=True)
+    NO_LVL = "（本期未改線）"
+    sel = st.sidebar.multiselect("本期改線日", dts + [NO_LVL])
+    if sel:
+        m_ = df[cols["lvl"]].isin([x for x in sel if x != NO_LVL])
+        if NO_LVL in sel:
+            m_ |= df[cols["lvl"]] == ""
+        mask &= m_
+
 if st.sidebar.checkbox("✅ 套用 30 秒 SOP 快篩", help="季線安全 → 量價 → K 棒，三關全過才顯示"):
     gate1 = (has("season", "上揚") | has("season", "走平")) & has("season", "位階安全")
     brk_ok = ((has("brk", "今日突破") | has("brk", "昨日突破"))
@@ -1396,10 +1444,14 @@ if st.sidebar.checkbox("✅ 套用 30 秒 SOP 快篩", help="季線安全 → �
                  & (has("kbar", "強力收腳") | has("kbar", "略有支撐")))
     mask &= gate1 & (brk_ok | retest_ok)
 
-sort_by = st.sidebar.selectbox("排序", ["關卡進度（高→低，回測→突破）", "清單原順序", "乖離率（接近壓力優先）", "當日漲跌（高→低）", "代號"])
+show_strat = st.sidebar.checkbox("清單中展開交易策略（較慢）", value=False,
+                                help="預設關閉：交易策略只在「個股明細」視窗裡看，清單會快很多。")
+sort_by = st.sidebar.selectbox("排序", ["關卡進度（高→低，回測→突破）", "本期改線日（新→舊）", "清單原順序", "乖離率（接近壓力優先）", "當日漲跌（高→低）", "代號"])
 view = df[mask].copy()
 if sort_by.startswith("關卡"):
     view = view.sort_values(["_score", "_trigB", "_ratio"], ascending=False, kind="stable")
+elif sort_by.startswith("本期改線日"):
+    view = view.sort_values(["_lvkey", "_score", "_trigB"], ascending=False, kind="stable")
 elif sort_by.startswith("乖離率"):
     view = view.sort_values("_dev", ascending=False, na_position="last")
 elif sort_by.startswith("當日"):
@@ -1565,7 +1617,9 @@ if view.empty:
     st.stop()
 
 c1, c2 = st.columns([1, 1])
-page_size = c1.selectbox("每頁顯示", ["全部", 20, 50, 100], index=0)
+page_size = c1.selectbox("每頁顯示", ["全部", 20, 50, 100], index=2)
+if page_size == "全部" and len(view) > 120:
+    c2.caption("⚠️ 一次列出超過 120 檔會比較慢，可改選 50 或 100。")
 if page_size == "全部":
     pages, page = 1, 1
     chunk = view
@@ -1588,7 +1642,7 @@ for i, row in chunk.iterrows():
         st.button("▲ 收起線圖" if is_open else "📈 內嵌線圖", key=f"b_{i}_{code}",
                   on_click=toggle, args=(code,), use_container_width=True)
     info = strategy_info(row, cols, band_pct)
-    if info:
+    if info and show_strat:
         with st.expander(f"📌 交易策略｜{info['state']}｜{zone_label(info)}"):
             render_strategy(code, info)
     if st.session_state.open_code == code:
