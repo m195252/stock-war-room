@@ -7,6 +7,7 @@ import html
 import io
 import os
 import re
+import time
 
 import pandas as pd
 import requests
@@ -36,8 +37,9 @@ COL_CANDIDATES = {
     "vol": ["量價", "N欄量價"],
     "season": ["季線", "O欄季線"],
     "month": ["月線", "P欄月線"],
-    "upd": ["上次更新日期", "更新日期", "更新時間", "最後更新", "更新"],
+    "upd": ["資料時間", "行情時間", "上次更新日期", "更新日期", "更新時間", "最後更新", "更新"],
     "lvl": ["本期改線日", "改線日", "最近改線日"],
+    "fav": ["自選", "⭐", "自選清單"],
 }
 PREFIX_FALLBACK = {"brk": "突破狀態", "dev": "乖離率", "support": "支撐", "resistance": "壓力"}
 
@@ -52,6 +54,89 @@ def pick_col(df, key):
             if str(c).startswith(pre):
                 return c
     return None
+
+
+def is_true(x):
+    """試算表「自選」欄：V、v、✓、✔、TRUE、1、是、Y、★、⭐ 都算有勾選。"""
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return False
+    return str(x).strip().lower() in ("v", "✓", "✔", "true", "1", "是", "y", "yes", "★", "⭐", "x")
+
+
+def _qp_get(k):
+    try:
+        return st.query_params.get(k, "") or ""
+    except Exception:
+        return ""
+
+
+def _qp_set(k, v):
+    try:
+        if v:
+            st.query_params[k] = v
+        elif k in st.query_params:
+            del st.query_params[k]
+    except Exception:
+        pass
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_levels(src):
+    """讀「網站最新」分頁（本期改線日、代號、股票名稱、分類、支撐價格、壓力價格）。"""
+    if src.startswith("http"):
+        r = requests.get(src, timeout=20)
+        r.raise_for_status()
+        text = r.content.decode("utf-8-sig")
+    else:
+        if not os.path.exists(src):
+            return None
+        with open(src, encoding="utf-8-sig") as f:
+            text = f.read()
+    d = pd.read_csv(io.StringIO(text), dtype=str).fillna("")
+    if "代號" not in d.columns:
+        return None
+    d["代號"] = d["代號"].astype(str).str.strip()
+    return d
+
+
+def trigger_refresh(url):
+    """呼叫試算表的 Apps Script 網頁應用程式，要求立刻抓一次最新行情。回傳 (成功與否, 訊息)。"""
+    try:
+        r = requests.get(url, timeout=120)
+        d = r.json()
+    except Exception as e:
+        return False, f"呼叫更新失敗（{type(e).__name__}）"
+    if d.get("ok"):
+        return True, f"已更新行情：成功 {d.get('ok_count')}／失敗 {d.get('failed')}（{d.get('at')}）"
+    if d.get("error") == "busy":
+        return False, "試算表正在更新中，稍後再按一次"
+    return False, "更新被拒絕：" + str(d.get("error"))
+
+
+def quote_age_text(df_, cols_):
+    """從「資料時間」欄找出最新的行情時間，回傳 (顯示文字, 距今分鐘數)；找不到回傳 (None, None)。"""
+    c_ = cols_.get("upd")
+    if not c_:
+        return None, None
+    now_tw = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=8)).replace(tzinfo=None)
+    best = None
+    for v_ in df_[c_].dropna().astype(str):
+        m_ = re.search(r"(\d{1,2})/(\d{1,2})\s+(\d{1,2}):(\d{2})", v_)
+        if not m_:
+            continue
+        mo, da, hh, mi = (int(x) for x in m_.groups())
+        try:
+            t_ = dt.datetime(now_tw.year, mo, da, hh, mi)
+        except ValueError:
+            continue
+        if t_ > now_tw + dt.timedelta(days=1):          # 跨年（例如 12 月看到 1 月）
+            t_ = t_.replace(year=t_.year - 1)
+        if best is None or t_ > best:
+            best = t_
+    if best is None:
+        return None, None
+    mins = max(0, int((now_tw - best).total_seconds() // 60))
+    return best.strftime("%m/%d %H:%M"), mins
 
 
 def norm_lvl(x):
@@ -511,7 +596,9 @@ def row_html(row, cols, gate):
     sup = row[cols["support"]] if cols["support"] else None
     res = row[cols["resistance"]] if cols["resistance"] else None
     cv = chg_num(row, cols)
-    upd = g(row, cols, "upd") or FETCHED_AT
+    upd_sheet = g(row, cols, "upd")
+    upd = upd_sheet or FETCHED_AT
+    upd_lbl = "行情" if upd_sheet else "讀取"
     lv = g(row, cols, "lvl")
     lv_html = (f'<div class="lv{" hot" if lv and lv == LATEST_LVL else ""}">改線 {e(lv)}</div>' if lv else "")
 
@@ -597,8 +684,8 @@ def row_html(row, cols, gate):
     return (
         f'<div class="rw2 {cls}"><div class="rw">'
         f'<div class="c1"><div class="cdb"><div class="cd">{e(g(row, cols, "code"))}</div>'
-        f'<div class="up">更新 {e(upd)}</div>{lv_html}</div>'
-        f'<div class="nmb"><div class="l1"><b class="nm">{e(g(row, cols, "name"))}</b>{tag}</div>'
+        f'<div class="up">{upd_lbl} {e(upd)}</div>{lv_html}</div>'
+        f'<div class="nmb"><div class="l1"><b class="nm">{"⭐ " if row.get("_fav2") else ""}{e(g(row, cols, "name"))}</b>{tag}</div>'
         f'<div class="sub">{sub}</div></div></div>'
         f'<div class="g-trig"><span class="ml">觸發</span>{c2}</div>'
         f'<div class="g-price"><span class="ml">現價</span>{c3}</div>'
@@ -1147,16 +1234,32 @@ sheet_url_input = st.sidebar.text_input(
 ).strip()
 sheet_url = sheet_url_input or DEFAULT_SHEET_URL
 path = st.sidebar.text_input("本機 CSV 路徑（最後備用）", value="watchlist.csv")
-if st.sidebar.button("🔄 重新載入清單"):
+_refresh_url = _secret("REFRESH_URL", "").strip()
+if st.sidebar.button("🔄 重新載入清單" + ("（含抓最新行情）" if _refresh_url else "")):
+    if _refresh_url:
+        with st.spinner("向試算表要求最新行情，約需 20～60 秒…"):
+            _ok, _msg = trigger_refresh(_refresh_url)
+            if _ok:
+                time.sleep(4)            # 讓試算表公式重算完
+        st.session_state["refresh_msg"] = ("✅ " if _ok else "⚠️ ") + _msg
+    st.session_state["reload_n"] = st.session_state.get("reload_n", 0) + 1
     st.cache_data.clear()
     st.rerun()
+if st.session_state.get("refresh_msg"):
+    st.sidebar.caption(st.session_state["refresh_msg"])
+st.sidebar.caption(
+    "設定讀取："
+    + "｜".join(f"{k_} {'✓' if _secret(k_, '').strip() else '✗'}" for k_ in ("SHEET_URL", "LEVELS_URL", "REFRESH_URL"))
+)
 
 try:
     if uploaded:
         df, FETCHED_AT = load_csv(uploaded)
     elif sheet_url:
+        _nonce = int(time.time() // 300) * 1000 + st.session_state.get("reload_n", 0)
+        _fresh = sheet_url + ("&" if "?" in sheet_url else "?") + "cb=" + str(_nonce)
         try:
-            df, FETCHED_AT = load_csv(sheet_url)
+            df, FETCHED_AT = load_csv(_fresh)
         except Exception as e1:
             st.sidebar.warning(
                 f"Google Sheet 讀取失敗（{type(e1).__name__}），已改用本機檔案。"
@@ -1185,6 +1288,18 @@ for k in ("support", "resistance", "price"):
         df[cols[k]] = to_num(df[cols[k]])
 df["_dev"] = to_num(df[cols["dev"]].astype(str).str.replace("%", "", regex=False)) if cols["dev"] else float("nan")
 df["_chg"] = to_num(df[cols["chg"]].astype(str).str.replace("%", "", regex=False)) if cols["chg"] else float("nan")
+levels_df = None
+_lvl_url = _secret("LEVELS_URL", "").strip()
+if _lvl_url:
+    try:
+        levels_df = load_levels(_lvl_url)
+    except Exception as e:
+        st.sidebar.warning(f"讀取「網站最新」分頁失敗（{type(e).__name__}）")
+if levels_df is not None and not cols["lvl"] and "本期改線日" in levels_df.columns:
+    _mp = dict(zip(levels_df["代號"], levels_df["本期改線日"]))
+    df["本期改線日"] = df[cols["code"]].map(lambda c_: _mp.get(str(c_).strip(), ""))
+    cols["lvl"] = "本期改線日"
+
 if cols["lvl"]:
     df[cols["lvl"]] = df[cols["lvl"]].map(norm_lvl)
     _lv = [x for x in df[cols["lvl"]] if x]
@@ -1192,6 +1307,24 @@ if cols["lvl"]:
     df["_lvkey"] = df[cols["lvl"]].map(lambda x: int(x[:2]) * 100 + int(x[3:]) if x else -1)
 else:
     df["_lvkey"] = -1
+
+# ⭐ 自選清單：試算表「自選」欄打 V ＋ 側邊欄臨時輸入的代號（存在網址，書籤或主畫面捷徑可保留）
+st.sidebar.divider()
+st.sidebar.markdown("**⭐ 自選清單**")
+if "extra_watch" not in st.session_state:
+    st.session_state["extra_watch"] = _qp_get("w")
+extra_txt = st.sidebar.text_input(
+    "額外自選代號（用逗號或空白分隔）", key="extra_watch",
+    help="例：2330, 6155。存在這個網址裡，不會跨裝置同步；要長期保留請在試算表「自選」欄打 V。",
+)
+_qp_set("w", extra_txt.strip())
+extra = {c_ for c_ in re.split(r"[,\s，、]+", extra_txt) if c_}
+df["_fav"] = df[cols["fav"]].map(is_true) if cols["fav"] else False
+df["_fav2"] = df["_fav"] | df[cols["code"]].isin(extra)
+_have = set(df[cols["code"]])
+missing_extra = sorted(c_ for c_ in extra if c_ not in _have)
+if missing_extra:
+    st.sidebar.warning("不在觀察清單：" + "、".join(missing_extra) + "。要看完整分析，請在試算表 B 欄新增這些代號。")
 
 
 def has(colkey, text):
@@ -1205,6 +1338,16 @@ def has(colkey, text):
 # 頂部：分類熱度 + 篩選欄
 # ------------------------------------------------------------------
 mask = pd.Series(True, index=df.index)
+
+_qt, _age = quote_age_text(df, cols)
+if _qt:
+    _now_tw = dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=8)
+    _open = _now_tw.weekday() < 5 and 900 <= _now_tw.hour * 100 + _now_tw.minute <= 1335
+    st.caption(f"📡 行情資料時間 {_qt}（約 {_age} 分鐘前）｜表格讀取 {FETCHED_AT}")
+    if _open and _age is not None and _age > 25:
+        st.warning("盤中行情已超過 25 分鐘沒有更新。可以到試算表選「行情 → 立即更新行情」，並確認自動更新有在跑。")
+else:
+    st.caption(f"📡 表格讀取 {FETCHED_AT}（試算表沒有「資料時間」欄，看不出行情本身多新）")
 
 # 1) 分類「當天漲跌」平均熱度（以全部標的計算，不受篩選影響）
 if cols["cat"] and cols["chg"]:
@@ -1355,14 +1498,29 @@ tf = st.session_state.trig_filter
 lvl = st.session_state.gate_level
 n_b = int((df["_trigB"] == 1).sum())
 n_a = int(((df["_score"] >= 1) & (df["_trigB"] == 0)).sum())
-bcs = st.columns(6)
+if "fav_only" not in st.session_state:
+    st.session_state.fav_only = False
+
+
+def _toggle_fav():
+    st.session_state.fav_only = not st.session_state.fav_only
+
+
+n_fav = int(df["_fav2"].sum())
+bcs = st.columns(7)
 bcs[0].button(
+    f"✔ 只看自選（{n_fav}）" if st.session_state.fav_only else f"⭐ 自選（{n_fav}）",
+    on_click=_toggle_fav, type="primary" if st.session_state.fav_only else "secondary",
+    key="btn_fav", use_container_width=True,
+    help="試算表「自選」欄打 V 的，加上側邊欄臨時輸入的代號。",
+)
+bcs[1].button(
     f"✔ 回測訊號（{n_b}）" if tf == "B" else f"🎯 回測訊號（{n_b}）",
     on_click=_set_trig, args=("B",), type="primary" if tf == "B" else "secondary",
     key="btn_trig_b", use_container_width=True,
     help="第一關判定為「回測」的個股（突破狀態含回測支撐，或已突破／昨日突破且操作建議含回測買點）。",
 )
-bcs[1].button(
+bcs[2].button(
     f"✔ 突破訊號（{n_a}）" if tf == "A" else f"🔥 突破訊號（{n_a}）",
     on_click=_set_trig, args=("A",), type="primary" if tf == "A" else "secondary",
     key="btn_trig_a", use_container_width=True,
@@ -1370,11 +1528,13 @@ bcs[1].button(
 )
 for k_, label_ in ((1, "通過第一關"), (2, "通過第二關"), (3, "通過第三關"), (4, "✅ 通過四關")):
     n_k = int((df["_score"] >= k_).sum())
-    bcs[k_ + 1].button(
+    bcs[k_ + 2].button(
         f"✔ {label_}（{n_k}）" if lvl == k_ else f"{label_}（{n_k}）",
         on_click=_set_level, args=(k_,), type="primary" if lvl == k_ else "secondary",
         key=f"btn_gate{k_}", use_container_width=True,
     )
+if st.session_state.fav_only:
+    mask &= df["_fav2"]
 if tf == "B":
     mask &= df["_trigB"] == 1
 elif tf == "A":
@@ -1476,6 +1636,12 @@ mm[1].metric("強勢突破", count("status", "強勢突破"))
 mm[2].metric("回測買點", count("op", "回測買點"))
 mm[3].metric("跌破支撐", count("status", "跌破支撐"))
 st.markdown('<div class="mini-title">股票戰情室</div>', unsafe_allow_html=True)
+
+if missing_extra and levels_df is not None:
+    _show = levels_df[levels_df["代號"].isin(missing_extra)]
+    if not _show.empty:
+        st.caption("⭐ 以下自選代號還沒加進試算表，只能顯示網站的支撐壓力（加到 B 欄後才有關卡分析）")
+        st.table(_show[[c_ for c_ in ["代號", "股票名稱", "分類", "支撐價格", "壓力價格", "本期改線日"] if c_ in _show.columns]])
 
 with st.expander("📐 交易策略：條件與參數", expanded=False):
     p1, p2, p3, p4 = st.columns(4)
